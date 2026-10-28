@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gurítsd a golyót</title>
+<style>
+  :root { --fg: #5fd35f; --bg: #000; --dim: #3a8a3a; }
+  html, body { margin: 0; background: #111; color: #cfc; font-family: Consolas, "Courier New", monospace; }
+  body { display: flex; flex-direction: column; align-items: center; padding: 12px 16px; box-sizing: border-box; min-height: 100vh; }
+  #screen { width: min(100%, 1056px); aspect-ratio: 44 / 29; height: auto; background: var(--bg); }
+  .bar { width: min(100%, 1056px); display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; margin-top: 10px; font-size: 14px; line-height: 1.5; }
+  .keys b { color: var(--fg); }
+  select { background: #000; color: var(--fg); border: 1px solid var(--dim); font: inherit; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="704" height="464"></canvas>
+<div class="bar">
+  <div class="keys">
+    <b>↑ ↓</b> sor választása &nbsp; <b>Enter / Szóköz</b> indítás &nbsp;
+    <b>← ↑ → ↓</b> irány számjegy után &nbsp; <b>*</b> lövés &nbsp;
+    <b>Szóköz</b> szünet &nbsp; <b>Backspace</b> új pálya
+  </div>
+  <label>Sebesség:
+    <select id="speed">
+      <option value="220">lassú</option>
+      <option value="110" selected>normál</option>
+      <option value="50">gyors</option>
+    </select>
+  </label>
+</div>
+<script>
+"use strict";
+// Gurítsd a golyót – Erdélyi Tibor, Commodore-64, 1987. május.
+// Böngészős változat; a logika a BASIC eredetit követi (sorszámok a megjegyzésekben).
+
+const W = 40, H = 25, CW = 16, CH = 16;
+const MX = 2, MY = 2;      // fekete keret (karakterben), mint a C64 kerete
+const PW = (W + 2 * MX) * CW, PH = (H + 2 * MY) * CH;
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const speedSel = document.getElementById("speed");
+
+// ---- Képernyő (40x25 karakter) ----
+let scr = [];
+function cls() { scr = Array.from({ length: H }, () => Array.from({ length: W }, () => ({ c: " ", r: false }))); }
+function put(o, s, c, r = false) { if (o >= 0 && o < W && s >= 0 && s < H) scr[s][o] = { c, r }; }
+function putStr(o, s, str, r = false) { for (let i = 0; i < str.length; i++) put(o + i, s, str[i], r); }
+function peek(o, s) { return scr[s][o].c; }
+
+function render() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || PW;
+  const scale = Math.max(1, Math.round((cssW / PW) * dpr));
+  if (canvas.width !== PW * scale) { canvas.width = PW * scale; canvas.height = PH * scale; }
+  const fg = "#5fd35f", bg = "#000";
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, PW, PH);
+  ctx.translate(MX * CW, MY * CH);
+  ctx.font = "bold 15px Consolas, 'Courier New', monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 2; ctx.lineCap = "square";
+  updateClock();
+  const blink = Math.floor(performance.now() / 300) % 2 === 0;
+  for (let s = 0; s < H; s++) for (let o = 0; o < W; o++) {
+    let { c, r } = scr[s][o];
+    if (cursor && cursor.o === o && cursor.s === s && blink) r = !r;
+    const x = o * CW, y = s * CH;
+    if (r) { ctx.fillStyle = fg; ctx.fillRect(x, y, CW, CH); }
+    const col = r ? bg : fg;
+    ctx.fillStyle = col; ctx.strokeStyle = col;
+    if (c === "/") { ctx.beginPath(); ctx.moveTo(x + 1, y + CH - 1); ctx.lineTo(x + CW - 1, y + 1); ctx.stroke(); }
+    else if (c === "\\") { ctx.beginPath(); ctx.moveTo(x + 1, y + 1); ctx.lineTo(x + CW - 1, y + CH - 1); ctx.stroke(); }
+    else if (c === "●") { ctx.beginPath(); ctx.arc(x + CW / 2, y + CH / 2, 5, 0, Math.PI * 2); ctx.fill(); }
+    else if (c !== " ") ctx.fillText(c, x + CW / 2, y + CH / 2 + 1);
+  }
+  requestAnimationFrame(render);
+}
+let cursor = null;
+
+// ---- Billentyűzet (GET X$) ----
+const keyQueue = [];
+let keyWaiter = null;
+window.addEventListener("keydown", e => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  let k = e.key;
+  if (k.length === 1) k = k.toUpperCase();
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " ", "Backspace", "Enter"].includes(k)) e.preventDefault();
+  if (keyWaiter) { const w = keyWaiter; keyWaiter = null; w(k); } else keyQueue.push(k);
+});
+function getKey() { return keyQueue.length ? keyQueue.shift() : ""; }
+function waitKey() { return keyQueue.length ? Promise.resolve(keyQueue.shift()) : new Promise(res => keyWaiter = res); }
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+const rnd = n => Math.floor(Math.random() * n);
+
+// ---- Játékosok ----
+let players = [];          // { name, po (pont), tu (lövések), time (ms) }
+let active = -1, turnStart = 0;
+
+function fmtTime(ms) {
+  const t = Math.floor(ms / 1000);
+  const p = n => String(n).padStart(2, "0");
+  return p(Math.floor(t / 3600) % 100) + ":" + p(Math.floor(t / 60) % 60) + ":" + p(t % 60);
+}
+function curTime(i) { return players[i].time + (i === active ? performance.now() - turnStart : 0); }
+function startClock(i) { active = i; turnStart = performance.now(); }
+function stopClock() { if (active >= 0) players[active].time = curTime(active); active = -1; }
+function updateClock() { if (active >= 0) putStr(1, active * 5 + 3, fmtTime(curTime(active))); }  // 300-370
+function fmtNum(n) { return (n < 0 ? "-" : " ") + Math.abs(n); }
+function showScore(i) { putStr(0, i * 5 + 4, (fmtNum(players[i].po) + "            ").slice(0, 12)); }  // 250-280
+function showShots(i) {                                                                              // 410-450
+  if (players[i].tu < 0) players[i].tu = 0;
+  putStr(0, i * 5 + 5, ("*".repeat(players[i].tu) + "           ").slice(0, 11));
+}
+function showPlayers(cur) {                                                                          // 960-1030
+  players.forEach((p, i) => {
+    putStr(0, i * 5 + 2, p.name, i === cur);
+    putStr(1, i * 5 + 3, fmtTime(curTime(i)));
+    showScore(i); showShots(i);
+  });
+}
+
+// ---- Pálya ----
+function placeRandom(ch) {                                                                           // 620-670
+  for (;;) {
+    const s = 2 + rnd(22), o = 13 + rnd(24);
+    const c = peek(o, s);
+    if (c === "+" || c === ".") { put(o, s, ch); return; }
+  }
+}
+function addElements() {                                                                             // 1040-1180
+  for (let i = 1; i <= 10; i++) {
+    placeRandom(String(1 + rnd(9)));
+    placeRandom("/");
+    placeRandom("\\");
+    placeRandom(" ");
+    if (i % 2 === 0) placeRandom("?");
+  }
+}
+function drawBoard(cur) {                                                                            // 810-1180
+  cls();
+  putStr(13, 0, "     GURITSD A GOLYOT");
+  for (let k = 0; k < 26; k++) put(13 + k, 1, k % 2 ? "\\" : "/");
+  for (let s = 2; s <= 23; s++) {
+    const even = s % 2 === 0;
+    put(13, s, even ? "\\" : "/");
+    for (let o = 14; o <= 37; o++) put(o, s, "+");
+    put(38, s, even ? "/" : "\\");
+  }
+  for (let k = 0; k < 26; k++) put(13 + k, 24, k % 2 ? "/" : "\\");
+  showPlayers(cur);
+  addElements();
+}
+
+// ---- Egy játékos köre egy pályán ----
+// Visszatérés: "newboard" (új pálya, ugyanaz a játékos) vagy "over" (vége a játékos játékának)
+async function playBoard(va) {
+  const pl = players[va];
+  let jj = 0, lt = 0;
+  for (;;) {
+    // 1470-1620: golyó beállítása
+    showPlayers(va);
+    let s = 2, a = 1;
+    put(12, s, "●");
+    for (;;) {
+      const k = await waitKey();
+      if (k === "Enter" || k === " ") break;
+      if (k === "ArrowDown") a = 1; else if (k === "ArrowUp") a = -1; else continue;
+      put(12, s, " ");
+      s = Math.min(23, Math.max(2, s + a));
+      put(12, s, "●");
+    }
+    // 1630-1690: indítás – a bal keret oszlopán áthalad
+    put(12, s, " ");
+    let o = 13, z = peek(o, s), b = 0;
+    a = 1;
+    put(o, s, "●");
+    let restartBall = false;
+    keyQueue.length = 0;
+
+    while (!restartBall) {
+      // 1700-1750: lépés
+      put(o, s, z);
+      o += a; s += b;
+      z = peek(o, s);
+      put(o, s, "●");
+      await sleep(+speedSel.value);
+
+      const reflect = () => {                                                                       // 2600-2680
+        if (z === "/") { if (b === 0) { b = -a; a = 0; } else { a = -b; b = 0; } }
+        else { if (b === 0) { b = a; a = 0; } else { a = b; b = 0; } }
+      };
+      if (o < 14 || o > 37 || s < 2 || s > 23) { reflect(); continue; }                             // 1760-1770
+
+      // 1780-1950: billentyűk menet közben
+      const k = getKey();
+      if (k === "Backspace") { put(o, s, z); return "newboard"; }                                   // 1830 (←)
+      if (k === "*" && pl.tu > 0) { pl.tu--; showShots(va); lt = Math.max(lt, 0) + 5; }              // 1860-1920
+      if (k === " ") await waitKey();                                                               // 1940-1950
+
+      // 1960-2210: számjegy – pontszerzés
+      const d = "123456789".indexOf(z) + 1;
+      if (d > 0) {
+        pl.po += d * 10; z = "."; showScore(va);
+        if (++jj >= 7) {                                                                           // 2050-2160: jutalom
+          for (let i = 0; i < 10; i++) {
+            putStr(0, va * 5 + 6, "JUTALOM !"); await sleep(120);
+            putStr(0, va * 5 + 6, "JUTALOM !", true); await sleep(120);
+          }
+          return "newboard";
+        }
+        const k2 = await waitKey();
+        if (k2 === "ArrowUp") { a = 0; b = -1; continue; }
+        if (k2 === "ArrowDown") { a = 0; b = 1; continue; }
+        if (k2 === "ArrowLeft") { a = -1; b = 0; continue; }
+        if (k2 === "ArrowRight") { a = 1; b = 0; continue; }
+      }
+
+      lt--;                                                                                         // 2230
+      if (z === "+") { pl.po++; z = "."; showScore(va); continue; }                                 // 2240-2310
+      if (z === ".") continue;                                                                      // 2330
+      if (lt > 0) continue;                                                                         // 2340: lövés – áthalad
+      if (z === "?") {                                                                              // 2370-2570: kérdőjel
+        z = ".";
+        switch (1 + rnd(7)) {
+          case 1: return "newboard";                                                                // 2520 teljesen új pálya
+          case 2: return "over";                                                                    // 2720 vége a játéknak
+          case 3: pl.po += rnd(400) + 1 - 200; showScore(va); break;                                // 2480 ±200 pont
+          case 4: pl.po = rnd(2) ? pl.po * 2 : Math.floor(pl.po / 2); showScore(va); break;          // 2540 dupla vagy fele
+          case 5: break;                                                                            // 1700 halad tovább
+          case 6: put(o, s, "."); addElements(); showPlayers(va); jj = 0; restartBall = true; break; // 2420 újabb elemek
+          case 7: pl.tu = Math.min(10, pl.tu + 5); showShots(va); break;                             // 2450 +5 lövés
+        }
+        continue;
+      }
+      if (z === " ") return "over";                                                                 // 2590: üres mező
+      reflect();
+    }
+  }
+}
+
+// ---- Teljes játék ----
+async function enterNames() {                                                                        // 1220-1380
+  cls();
+  putStr(12, 0, "GURITSD A GOLYOT");
+  putStr(10, 22, "ERDELYI TIBOR, 1987");
+  players = [];
+  for (let i = 0; i < 4; i++) {
+    const row = 3 + i * 2;
+    putStr(0, row, `KEREM A ${i + 1}. VERSENYZO NEVET:`);
+    let name = "";
+    const col = 28;
+    for (;;) {
+      cursor = { o: col + name.length, s: row };
+      const k = await waitKey();
+      if (k === "Enter") { if (name.trim() || i > 0) break; else continue; }
+      if (k === "Backspace") { if (name) { name = name.slice(0, -1); put(col + name.length, row, " "); } continue; }
+      if (k.length === 1 && name.length < 12 && /[A-Z0-9 .\-]/.test(k)) { put(col + name.length, row, k); name += k; }
+    }
+    cursor = null;
+    if (!name.trim()) break;
+    players.push({ name: (name + " ".repeat(12)).slice(0, 12), po: 0, tu: 5, time: 0 });
+  }
+}
+
+async function playGame() {
+  players.forEach(p => { p.po = 0; p.tu = 5; p.time = 0; });
+  for (let vb = 0; vb < players.length;) {                                                          // 1420-2760
+    startClock(vb);
+    drawBoard(vb);
+    const r = await playBoard(vb);
+    stopClock();
+    if (r === "over") { await sleep(700); vb++; }
+  }
+}
+
+async function results() {                                                                           // 2770-3010
+  players.sort((x, y) => y.po - x.po);
+  cls();
+  putStr(0, 0, "   G U R I T S D   A   G O L Y O T");
+  putStr(0, 2, "            EREDMENYHIRDETES");
+  putStr(0, 6, "N E V           PONT      IDO");
+  players.forEach((p, i) => {
+    putStr(0, 8 + i * 2, p.name + fmtNum(p.po).padStart(10) + " " + fmtTime(p.time));
+  });
+  putStr(0, 18, "KER UJ JATEKOT ? I/N");
+  cursor = { o: 21, s: 18 };
+  for (;;) {
+    const k = await waitKey();
+    if (k === "I" || k === "Y") { cursor = null; return true; }
+    if (k === "N") { cursor = null; return false; }
+  }
+}
+
+async function main() {
+  for (;;) {
+    await enterNames();
+    do await playGame(); while (await results());
+    cls();
+    putStr(0, 0, " V I S Z O N T L A T A S R A !");
+    putStr(0, 3, "UJ JATEK: ENTER");
+    while (await waitKey() !== "Enter");
+  }
+}
+
+cls();
+requestAnimationFrame(render);
+main();
+</script>
+</body>
+</html>
